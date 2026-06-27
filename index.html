@@ -323,18 +323,23 @@ const SURAHS = [
     [111,"المسد"],[112,"الإخلاص"],[113,"الفلق"],[114,"الناس"]
 ];
 
-/* الشيوخ مع معرفاتهم في islamic.network */
+/* الشيوخ - يتم البحث عن كل شيخ ورابطه الصحيح لحظياً من خدمة mp3quran.net
+   (تم استبدال القائمة القديمة لأن بعض المعرّفات كانت خاطئة تماماً:
+   مثلاً "ar.parhizgar" كانت في الحقيقة تخص شيخاً إيرانياً مختلفاً تماماً
+   اسمه Shahriar Parhizgar، وليس "عبد الله عمر الفارسي" كما كانت موصوفة،
+   وبعض الشيوخ الآخرين -مثل الحصري- لم يكونا موجودين أصلاً في كتالوج
+   الصوت بالسورة الكاملة على ذلك السيرفر) */
 const RECITERS = [
-    {id:"ar.abdulbasitmurattal", name:"عبد الباسط عبد الصمد - مرتل"},
-    {id:"ar.abdulbasitmujawwad", name:"عبد الباسط عبد الصمد - مجود"},
-    {id:"ar.alafasy",            name:"مشاري العفاسي"},
-    {id:"ar.mahermuaiqly",       name:"ماهر المعيقلي"},
-    {id:"ar.husary",             name:"محمود خليل الحصري"},
-    {id:"ar.minshawi",           name:"محمد صديق المنشاوي"},
-    {id:"ar.muhammadayyoub",     name:"محمد أيوب"},
-    {id:"ar.parhizgar",          name:"عبد الله عمر الفارسي"},
-    {id:"ar.shaatree",           name:"أبو بكر الشاطري"},
-    {id:"ar.saoodashuraym",      name:"سعود الشريم"},
+    {id:"basit_murattal", name:"عبد الباسط عبد الصمد - مرتل", nameMatch:"عبدالباسط", moshafMatch:"مرتل"},
+    {id:"basit_mujawwad",  name:"عبد الباسط عبد الصمد - مجود", nameMatch:"عبدالباسط", moshafMatch:"مجود"},
+    {id:"afasy",           name:"مشاري العفاسي",               nameMatch:"العفاسي"},
+    {id:"muaiqly",         name:"ماهر المعيقلي",                nameMatch:"المعيقلي"},
+    {id:"husary",          name:"محمود خليل الحصري",            nameMatch:"الحصري", moshafMatch:"مرتل"},
+    {id:"minshawi",        name:"محمد صديق المنشاوي",           nameMatch:"المنشاوي", moshafMatch:"مرتل"},
+    {id:"ayyoub",          name:"محمد أيوب",                    nameMatch:"أيوب"},
+    {id:"shuraym",         name:"سعود الشريم",                  nameMatch:"الشريم"},
+    {id:"shatri",          name:"أبو بكر الشاطري",               nameMatch:"الشاطري"},
+    {id:"dosari",          name:"ياسر الدوسري",                 nameMatch:"الدوسري"},
 ];
 
 /* صفحات بداية كل سورة في المصحف (604 صفحة) */
@@ -349,6 +354,37 @@ const SURAH_PAGES = [
 
 let currentSurah = 1;
 let currentReciter = RECITERS[0].id;
+let _mp3quranCache = null; // كاش لقائمة الشيوخ القادمة من mp3quran.net حتى لا نطلبها كل مرة
+
+/* تطبيع النص العربي (حذف التشكيل والمسافات) لتسهيل المطابقة بين الاسم في القائمة واسم الشيخ في الـ API */
+function normalizeAr(s) {
+    return (s || '').replace(/[\u064B-\u065F\u0670\s]/g, '');
+}
+
+/* تحميل قائمة كل الشيوخ من خدمة mp3quran.net (مصدر موثوق ومُحدَّث لصوت السورة كاملة) */
+async function fetchMp3QuranReciters() {
+    if (_mp3quranCache) return _mp3quranCache;
+    const res = await fetch('https://www.mp3quran.net/api/v3/reciters?language=ar');
+    if (!res.ok) throw new Error('mp3quran fetch failed');
+    const data = await res.json();
+    _mp3quranCache = data.reciters || [];
+    return _mp3quranCache;
+}
+
+/* إيجاد رابط سيرفر الشيخ المطلوب (وأحياناً رواية/طريقة تلاوة معينة كمرتل أو مجوّد) */
+async function resolveReciterServer(reciterCfg) {
+    const list = await fetchMp3QuranReciters();
+    const target = normalizeAr(reciterCfg.nameMatch);
+    const match = list.find(r => normalizeAr(r.name).includes(target));
+    if (!match || !match.moshaf || !match.moshaf.length) return null;
+    let moshaf = match.moshaf[0];
+    if (reciterCfg.moshafMatch) {
+        const targetMoshaf = normalizeAr(reciterCfg.moshafMatch);
+        const found = match.moshaf.find(m => normalizeAr(m.name || '').includes(targetMoshaf));
+        if (found) moshaf = found;
+    }
+    return moshaf.server;
+}
 let subhaCount = 0;
 let mushafPage = 1;
 
@@ -363,7 +399,7 @@ function resetSubha() {
 }
 
 /* ======= القرآن: تشغيل سورة ======= */
-function playSurah(num) {
+async function playSurah(num) {
     currentSurah = num;
     const name = SURAHS[num-1][1];
     document.getElementById('np-name').textContent = 'سورة ' + name;
@@ -375,30 +411,33 @@ function playSurah(num) {
     if(active){ active.classList.add('active'); active.scrollIntoView({block:'nearest',behavior:'smooth'}); }
 
     const audio = document.getElementById('main-audio');
-    const triedBitrates = [128, 64, 32];
-    let bitrateIdx = 0;
+    const reciterCfg = RECITERS.find(r => r.id === currentReciter) || RECITERS[0];
 
-    function tryLoad() {
-        const bitrate = triedBitrates[bitrateIdx];
-        audio.src = `https://cdn.islamic.network/quran/audio-surah/${bitrate}/${currentReciter}/${num}.mp3`;
-        audio.load();
-        audio.play().catch(()=>{
-            document.getElementById('q-loading').textContent = 'اضغط زر التشغيل أعلاه لبدء الاستماع';
-        });
+    let server;
+    try {
+        server = await resolveReciterServer(reciterCfg);
+    } catch (e) {
+        document.getElementById('q-loading').textContent = '⚠️ تعذّر الاتصال بخادم الصوت، تحقق من الإنترنت';
+        return;
     }
+    if (!server) {
+        document.getElementById('q-loading').textContent = '⚠️ هذا الشيخ غير متاح حالياً، جرّب شيخاً آخر';
+        return;
+    }
+
+    const surahPadded = String(num).padStart(3, '0');
+    audio.src = server + surahPadded + '.mp3';
+    audio.load();
 
     audio.oncanplay = () => { document.getElementById('q-loading').textContent = ''; };
     audio.onerror  = () => {
-        bitrateIdx++;
-        if (bitrateIdx < triedBitrates.length) {
-            tryLoad();
-        } else {
-            document.getElementById('q-loading').textContent = '⚠️ تعذّر التحميل، جرّب شيخاً آخر';
-        }
+        document.getElementById('q-loading').textContent = '⚠️ تعذّر تحميل هذه السورة، جرّب شيخاً آخر';
     };
     audio.onended  = () => { if(currentSurah < 114) playSurah(currentSurah+1); };
 
-    tryLoad();
+    audio.play().catch(()=>{
+        document.getElementById('q-loading').textContent = 'اضغط زر التشغيل أعلاه لبدء الاستماع';
+    });
 }
 
 function changeReciter(val) {
@@ -422,9 +461,10 @@ function loadMushafPage(p) {
     loading.textContent = 'جاري تحميل الصفحة...';
 
     // مصادر الصور (يتم تجربتها بالترتيب حتى تنجح واحدة)
+    // المصدر الأول والثاني تم التأكد من وجودهما فعلياً (ملفات بصيغة 001.png بدون مجلدات فرعية)
     const sources = [
-        `https://cdn.jsdelivr.net/gh/QuranHub/quran-pages-images@main/ayat/hafs/${p}.png`,
-        `https://raw.githubusercontent.com/QuranHub/quran-pages-images/main/ayat/hafs/${p}.png`,
+        `https://cdn.jsdelivr.net/gh/GovarJabbar/Quran-PNG@master/${String(p).padStart(3,'0')}.png`,
+        `https://raw.githubusercontent.com/GovarJabbar/Quran-PNG/master/${String(p).padStart(3,'0')}.png`,
         `https://quran.ksu.edu.sa/ayat/_img/pages/hafs/p${String(p).padStart(3,'0')}.png`
     ];
     let srcIdx = 0;
